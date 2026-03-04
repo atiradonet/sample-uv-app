@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
 
 import httpx
 import typer
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolResultBlockParam, ToolUseBlock
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -52,7 +53,7 @@ class SearchOutput(BaseModel):
 DUCKDUCKGO_URL = "https://api.duckduckgo.com/"
 
 
-def web_search(query: str, max_results: int = 5) -> SearchOutput:
+async def web_search(query: str, max_results: int = 5) -> SearchOutput:
     """Fetch results from DuckDuckGo's instant answer API."""
     params = {
         "q": query,
@@ -61,8 +62,8 @@ def web_search(query: str, max_results: int = 5) -> SearchOutput:
         "skip_disambig": "1",
         "no_redirect": "1",
     }
-    with httpx.Client(timeout=10) as client:
-        response = client.get(DUCKDUCKGO_URL, params=params)
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(DUCKDUCKGO_URL, params=params)
         response.raise_for_status()
         data = response.json()
 
@@ -154,7 +155,7 @@ Always cite the sources you used in your final answer.
 """
 
 
-def run_agent(question: str, model: str, max_iterations: int) -> str:
+async def run_agent(question: str, model: str, max_iterations: int) -> str:
     """Run the ReAct agent loop and return the final answer."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -162,15 +163,13 @@ def run_agent(question: str, model: str, max_iterations: int) -> str:
             "ANTHROPIC_API_KEY is not set. Add it to your .env file or environment."
         )
 
-    client = Anthropic(api_key=api_key)
+    client = AsyncAnthropic(api_key=api_key)
     messages: list[MessageParam] = [{"role": "user", "content": question}]
-    iteration = 0
 
-    while iteration < max_iterations:
-        iteration += 1
+    for iteration in range(1, max_iterations + 1):
         console.print(Rule(f"[dim]Iteration {iteration}[/dim]", style="dim"))
 
-        response = client.messages.create(
+        response = await client.messages.create(
             model=model,
             max_tokens=4096,
             system=SYSTEM_PROMPT,
@@ -178,7 +177,6 @@ def run_agent(question: str, model: str, max_iterations: int) -> str:
             messages=messages,
         )
 
-        # Collect tool calls and text from this turn
         tool_uses: list[ToolUseBlock] = []
         reasoning_parts: list[str] = []
 
@@ -188,27 +186,21 @@ def run_agent(question: str, model: str, max_iterations: int) -> str:
             elif block.type == "tool_use":
                 tool_uses.append(block)
 
-        # Display any reasoning text
         if reasoning_parts:
-            reasoning_text = "\n".join(reasoning_parts)
             console.print(
                 Panel(
-                    Markdown(reasoning_text),
+                    Markdown("\n".join(reasoning_parts)),
                     title="[bold cyan]Reasoning[/bold cyan]",
                     border_style="cyan",
                     padding=(0, 1),
                 )
             )
 
-        # If no tool calls and stop_reason is end_turn, we have the final answer
         if response.stop_reason == "end_turn" and not tool_uses:
             return "\n".join(reasoning_parts)
 
-        # Process tool calls
         if tool_uses:
-            # Add assistant message with all content blocks
             messages.append({"role": "assistant", "content": response.content})
-
             tool_results: list[ToolResultBlockParam] = []
 
             for tool_use in tool_uses:
@@ -223,14 +215,13 @@ def run_agent(question: str, model: str, max_iterations: int) -> str:
 
                 try:
                     search_input = SearchInput(**tool_use.input)
-                    output = web_search(search_input.query, search_input.max_results)
+                    output = await web_search(search_input.query, search_input.max_results)
                     result_text = json.dumps(output.model_dump(), indent=2)
                     is_error = False
                 except Exception as exc:
                     result_text = f"Search failed: {exc}"
                     is_error = True
 
-                # Display search results summary
                 if not is_error:
                     results_display = "\n".join(
                         f"• **{r['title']}**\n  {r['snippet'][:120]}…\n  {r['url']}"
@@ -266,7 +257,6 @@ def run_agent(question: str, model: str, max_iterations: int) -> str:
             messages.append({"role": "user", "content": tool_results})
 
         elif response.stop_reason == "end_turn":
-            # No tool calls, no more content — return whatever we have
             return "\n".join(reasoning_parts)
 
     return "Maximum iterations reached without a conclusive answer."
@@ -296,7 +286,7 @@ def ask(
     console.print()
 
     try:
-        final_answer = run_agent(question, model, max_iterations)
+        final_answer = asyncio.run(run_agent(question, model, max_iterations))
     except typer.BadParameter as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(1)
